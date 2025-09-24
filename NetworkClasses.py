@@ -661,7 +661,7 @@ class CrissCross(Network):
         return MaxPressurePolicy(self.next_hop)
 
 
-# In[59]:
+# In[62]:
 
 
 # ----------------- KellyNetwork subclass -----------------
@@ -773,6 +773,7 @@ class KellyNetwork(Network):
             }
         soj = np.array([j.t_departure - j.t_arrival for j in jobs], dtype=float)
         cls1 = np.array([j.cls == "1" for j in jobs])
+        print(cls1)
         cls2 = np.array([j.cls == "2" for j in jobs])
         cls3 = np.array([j.cls == "3" for j in jobs])
 
@@ -925,12 +926,6 @@ class KellyNetwork(Network):
         plt.show()
 
         return results
-
-
-# In[ ]:
-
-
-
 
 
 # In[ ]:
