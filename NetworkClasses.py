@@ -415,7 +415,7 @@ def exp_service(mu: float, rng: np.random.Generator) -> Callable[[Job], float]:
 # In[47]:
 
 
-# ----------------- CrissCross subclass (your topology) -----------------
+# ----------------- CrissCross subclass -----------------
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -423,7 +423,6 @@ from typing import Dict, Any, List, Tuple, Optional
 
 class CrissCross(Network):
     """
-    Your criss-cross variant:
       - External class 1 -> S1:Q1
       - External class 2 -> S1:Q2
       - After S1 service: becomes class 3 -> S2:Q1
@@ -660,6 +659,278 @@ class CrissCross(Network):
         if "MaxPressurePolicy" not in globals():
             raise AttributeError("MaxPressurePolicy not defined.")
         return MaxPressurePolicy(self.next_hop)
+
+
+# In[59]:
+
+
+# ----------------- KellyNetwork subclass -----------------
+
+class KellyNetwork(Network):
+    """
+      - External class 1 -> S1:Q1
+      - External class 2 -> S1:Q2
+      - After S1 service:
+          * class 1 becomes class 3 -> S2:Q1 -> exit
+          * class 2 exits
+    Stations:
+      S1 has queues Q1 (cls '1') and Q2 (cls '2'), c1 servers.
+      S2 has queue  Q1 (cls '3'), c2 servers.
+    """
+
+    def __init__(self,
+                 policy: SchedulingPolicy,
+                 *,
+                 seed: int = 0,
+                 c1: int = 1, c2: int = 1,
+                 lam1: float = 0.8, lam2: float = 0.8,      # externals
+                 mu1: float = 2.4,  # S1 service rate for class '1'
+                 mu2: float = 1.6,  # S1 service rate for class '2'
+                 mu3: float = 2.0   # S2 service rate for class '3'
+                 ):
+        rng = np.random.default_rng(seed)
+
+        # --- service samplers (per station; class-based at S1) ---
+        def svc_S1(job: Job) -> float:
+            rate = mu1 if job.cls == "1" else mu2   # S1 serves '1' and '2'
+            return rng.exponential(1.0 / rate)
+
+        def svc_S2(job: Job) -> float:
+            # S2 serves only '3'
+            return rng.exponential(1.0 / mu3)
+
+        # --- stations/queues ---
+        S1 = Station(
+            "S1",
+            queues={"Q1": Queue("S1", "Q1"),   # holds class '1'
+                    "Q2": Queue("S1", "Q2")},  # holds class '2'
+            servers=[Server(f"S1-s{i}", svc_S1) for i in range(c1)]
+        )
+        S2 = Station(
+            "S2",
+            queues={"Q1": Queue("S2", "Q1")},  # holds class '3'
+            servers=[Server(f"S2-s{i}", svc_S2) for i in range(c2)]
+        )
+
+        # --- external arrivals (both into S1) ---
+        ap1 = ArrivalProcess("S1", "Q1", lambda: rng.exponential(1.0 / lam1), job_class="1")
+        ap2 = ArrivalProcess("S1", "Q2", lambda: rng.exponential(1.0 / lam2), job_class="2")
+
+        # --- router: after S1, 1 -> S2 as 3; 2 -> exit; after S2 -> exit ---
+        class _Router():
+            def route(self, job: Job, station_id: str, t: float) -> Optional[Tuple[str, str]]:
+                if station_id == "S1":
+                    if job.cls == "1":
+                        job.cls = "3"
+                        return ("S2", "Q1")
+                    if job.cls == "2":
+                        return None
+                if station_id == "S2":
+                    return None
+                return None
+
+        super().__init__(
+            stations={"S1": S1, "S2": S2},
+            arrivals=[ap1, ap2],
+            router=_Router(),
+            policy=policy,
+            rng=rng,
+        )
+
+        # for MaxPressure: (S1:Q1 -> S2:Q1), (S1:Q2 -> exit), (S2:Q1 -> exit)
+        self._next_hop = {
+            ("S1", "Q1"): ("S2", "Q1"),
+            ("S1", "Q2"): None,
+            ("S2", "Q1"): None,
+        }
+
+        # keep parameters handy
+        self._params = dict(c1=c1, c2=c2, lam1=lam1, lam2=lam2, mu1=mu1, mu2=mu2, mu3=mu3)
+
+    # ----------------- Metrics helpers -----------------
+
+    def reset_metrics(self) -> None:
+        self.completed_jobs = 0
+        self.sum_sojourn = 0.0
+        if hasattr(self, "exited_jobs"):
+            self.exited_jobs.clear()
+        self._measure_t0 = self.t
+
+    def summarize(self) -> Dict[str, Any]:
+        jobs = getattr(self, "exited_jobs", [])
+        window = max(1e-12, self.t - getattr(self, "_measure_t0", 0.0))
+        if not jobs:
+            return {
+                "completed": self.completed_jobs,
+                "mean_sojourn": self.mean_sojourn(),
+                "p50": float("nan"),
+                "p90": float("nan"),
+                "p95": float("nan"),
+                "mean_1": float("nan"),
+                "mean_2": float("nan"),
+                "mean_3": float("nan"),
+                "throughput_per_time": float("nan"),
+            }
+        soj = np.array([j.t_departure - j.t_arrival for j in jobs], dtype=float)
+        cls1 = np.array([j.cls == "1" for j in jobs])
+        cls2 = np.array([j.cls == "2" for j in jobs])
+        cls3 = np.array([j.cls == "3" for j in jobs])
+
+        def m(mask): return float(soj[mask].mean()) if mask.any() else float("nan")
+        def pct(a, p): return float(np.percentile(a, p)) if a.size else float("nan")
+        return {
+            "completed": int(len(jobs)),
+            "mean_sojourn": float(soj.mean()),
+            "p50": pct(soj, 50), "p90": pct(soj, 90), "p95": pct(soj, 95),
+            "mean_1": m(cls1), "mean_2": m(cls2), "mean_3": m(cls3),
+            "throughput_per_time": float(len(jobs) / window),
+        }
+
+    def run_warmup_and_measure(self,
+                               warmup_time: float = 1_000.0,
+                               measure_time: float = 2_000.0) -> Dict[str, Any]:
+        self.run(until_time=warmup_time)
+        self.reset_metrics()
+        t0 = self.t
+        self.run(until_time=t0 + measure_time)
+        return self.summarize()
+
+    # ----------------- Stability helpers -----------------
+    @staticmethod
+    def capacity_ok(lam1: float, lam2: float, c1: int, c2: int,
+                    mu1: float, mu2: float, mu3: float) -> Dict[str, float]:
+        """
+        Station 1 load: ρ1 = (λ1/μ1 + λ2/μ2) / c1
+        Station 2 load: ρ2 = (λ1/μ3) / c2    (only stream 1 continues)
+        """
+        rho1 = (lam1 / mu1 + lam2 / mu2) / c1
+        rho2 = (lam1 / mu3) / c2
+        return {"rho1": rho1, "rho2": rho2, "stable": float(rho1 < 1 and rho2 < 1)}
+
+    @staticmethod
+    def lambda_star_symmetric(mu1: float, mu2: float, mu3: float,
+                              c1: int = 1, c2: int = 1) -> float:
+        """
+        If λ1=λ2=λ, stability requires:
+          ρ1 = (λ/μ1 + λ/μ2)/c1  < 1  =>  λ < c1 / (1/μ1 + 1/μ2)
+          ρ2 = (λ/μ3)/c2         < 1  =>  λ < c2 * μ3
+        """
+        return min(c1 / (1.0/mu1 + 1.0/mu2), c2 * mu3)
+
+    # ----------------- Policy experiments (same pattern) -----------------
+    @classmethod
+    def run_policy_at_lambda(cls,
+                             policy_name: str,
+                             policy: SchedulingPolicy,
+                             lam: float,
+                             *,
+                             reps: int = 5,
+                             warmup_time: float = 1_000.0,
+                             measure_time: float = 2_000.0,
+                             seed0: int = 123,
+                             c1: int = 1, c2: int = 1,
+                             mu1: float = 2.4, mu2: float = 1.6, mu3: float = 2.0
+                             ) -> Dict[str, Any]:
+        """
+        Build fresh Kelly networks with λ1=λ2=lam for each replication, run warm-up + measure,
+        and aggregate mean sojourn, p95, and throughput.
+        """
+        rows: List[Dict[str, Any]] = []
+        for r in range(reps):
+            net = cls(policy=policy, seed=seed0 + r,
+                      c1=c1, c2=c2,
+                      lam1=lam, lam2=lam,
+                      mu1=mu1, mu2=mu2, mu3=mu3)
+            m = net.run_warmup_and_measure(warmup_time=warmup_time, measure_time=measure_time)
+            m["policy"] = policy_name
+            m["lam"] = lam
+            rows.append(m)
+
+        def agg(key: str) -> Tuple[float, float, int]:
+            vals = np.array([row.get(key, np.nan) for row in rows], dtype=float)
+            good = ~np.isnan(vals)
+            if not np.any(good): return (float("nan"), 0.0, 0)
+            return (float(np.nanmean(vals)), float(np.nanstd(vals, ddof=0)), int(np.sum(good)))
+
+        W_mean, W_sd, _  = agg("mean_sojourn")
+        p95_mean, _, _   = agg("p95")
+        thr_mean, _, _   = agg("throughput_per_time")
+
+        return {
+            "policy": policy_name,
+            "lam": lam,
+            "W_mean": W_mean,
+            "W_sd": W_sd,
+            "p95_mean": p95_mean,
+            "throughput": thr_mean,
+            "rows": rows,
+        }
+
+    @classmethod
+    def sweep_and_plot(cls,
+                       policies: List[Tuple[str, SchedulingPolicy]],
+                       lam_grid: np.ndarray,
+                       *,
+                       reps: int = 5,
+                       warmup_time: float = 1_000.0,
+                       measure_time: float = 5_000.0,
+                       seed0: int = 777,
+                       c1: int = 1, c2: int = 1,
+                       mu1: float = 2.4, mu2: float = 1.6, mu3: float = 2.0,
+                       title: str = "Kelly Network: Mean Sojourn vs λ (λ₁=λ₂=λ)"
+                       ) -> List[Dict[str, Any]]:
+        """
+        Sweep symmetric λ over lam_grid for the given policies, plot mean sojourn with error bars,
+        and return the aggregated results.
+        """
+        results: List[Dict[str, Any]] = []
+        for lam in lam_grid:
+            for name, pol in policies:
+                res = cls.run_policy_at_lambda(name, pol, lam,
+                                               reps=reps,
+                                               warmup_time=warmup_time,
+                                               measure_time=measure_time,
+                                               seed0=seed0,
+                                               c1=c1, c2=c2,
+                                               mu1=mu1, mu2=mu2, mu3=mu3)
+                results.append(res)
+
+        # organize for plotting
+        by_policy: Dict[str, Dict[str, np.ndarray]] = {}
+        for r in results:
+            d = by_policy.setdefault(r["policy"], {"lam": [], "W_mean": [], "W_sd": []})
+            d["lam"].append(r["lam"])
+            d["W_mean"].append(r["W_mean"])
+            d["W_sd"].append(r["W_sd"])
+
+        for pol, d in by_policy.items():
+            order = np.argsort(np.array(d["lam"]))
+            d["lam"] = np.array(d["lam"])[order]
+            d["W_mean"] = np.array(d["W_mean"])[order]
+            d["W_sd"] = np.array(d["W_sd"])[order]
+
+        plt.figure(figsize=(7.5, 4.5))
+        for pol, d in by_policy.items():
+            plt.errorbar(d["lam"], d["W_mean"], yerr=d["W_sd"],
+                         marker='o', linewidth=1.5, capsize=3, label=pol)
+
+        # show symmetric capacity limit (min of station constraints)
+        lam_star = cls.lambda_star_symmetric(mu1, mu2, mu3, c1=c1, c2=c2)
+        plt.axvline(lam_star, linestyle='--', linewidth=1.0)
+        plt.title(title)
+        plt.xlabel("Arrival rate λ (per external class)")
+        plt.ylabel("Mean sojourn time W")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+        return results
+
+
+# In[ ]:
+
+
+
 
 
 # In[ ]:
