@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[52]:
+# In[63]:
 
 
 from __future__ import annotations
@@ -184,7 +184,7 @@ class SchedulingPolicy:
         raise NotImplementedError
 
 
-class FIFOPolicy(SchedulingPolicy):
+class FIFOSysPolicy(SchedulingPolicy):
     """
     Greedy: at each decision epoch, for each free server, take from the
     non-empty queue of its own station in a fixed order (or max length).
@@ -201,6 +201,32 @@ class FIFOPolicy(SchedulingPolicy):
                     j = q.peek_n(used[q])       # 0=head, 1=second, ...
                     if j and j.q_arrival < best_time:
                         best_q, best_time = q, j.q_arrival
+                if best_q:
+                    assignments[srv] = best_q
+                    used[best_q] += 1
+        return assignments
+
+
+class FIFONetPolicy(SchedulingPolicy):
+    """
+    First-Come, First-Serve (FCFS) Policy - System-Wide.
+    At each decision epoch, for each free server, this policy assigns the job
+    that has been in the entire system the longest. This is determined by the
+    job's original network entry time (t_arrival).
+    """
+    
+    def decide(self, net, t, free_servers):
+        assignments: Dict[Server, Queue] = {}
+        for st_id, srvs in free_servers.items():
+            st = net.stations[st_id]
+            used = defaultdict(int)  # virtual pops per queue in this epoch
+            for srv in srvs:
+                best_q, best_time = None, float("inf")
+                for q in st.queues.values():
+                    j = q.peek_n(used[q])
+                    # THE ONLY CHANGE IS HERE: use j.t_arrival instead of j.q_arrival
+                    if j and j.t_arrival < best_time:
+                        best_q, best_time = q, j.t_arrival
                 if best_q:
                     assignments[srv] = best_q
                     used[best_q] += 1
@@ -236,7 +262,46 @@ class MaxWeightByQLenPolicy(SchedulingPolicy):
                     del queue_lengths[qid]
 
         return assignments
+
+class LBFSPolicy(SchedulingPolicy):
+    """
+    Last-Buffer First-Serve (LBFS) Policy.
+    At each station, this policy gives static priority to the non-empty queue
+    with the highest class index.
+    """
+    def decide(self, net: Network, t: float, free_servers: Dict[str, List[Server]]) -> Dict[Server, Queue]:
+        assignments: Dict[Server, Queue] = {}
+        for st_id, srvs in free_servers.items():
+            station = net.stations[st_id]
+
+            # Find the best non-empty queue based on the highest class index
+            best_q: Optional[Queue] = None
+            max_cls_id = -1
+
+            for q in station.queues.values():
+                if len(q) > 0:
+                    # Parse class ID from queue ID (e.g., "Q7" -> 7)
+                    try:
+                        cls_id = int(q.queue_id.replace("Q", ""))
+                        if cls_id > max_cls_id:
+                            max_cls_id = cls_id
+                            best_q = q
+                    except ValueError:
+                        # Handle non-numeric queue IDs if they exist
+                        continue
             
+            # If a priority queue was found, assign all free servers to it
+            if best_q:
+                # Keep track of jobs assigned from the best queue in this epoch
+                jobs_to_assign = len(best_q)
+                for srv in srvs:
+                    if jobs_to_assign > 0:
+                        assignments[srv] = best_q
+                        jobs_to_assign -= 1
+                    else:
+                        break # No more jobs in the priority queue
+                        
+        return assignments
 
 # -------- Network (orchestrator) --------
 
@@ -286,28 +351,34 @@ class Network:
             self._seeded = True
     
         while self._event_q:
-            # ----- key change: peek (don’t pop) to enforce until_time -----
             if until_time is not None and self._event_q[0].time > until_time:
                 break
     
             ev = heapq.heappop(self._event_q)
     
             if until_jobs is not None and self.completed_jobs >= until_jobs:
-                # optional: push back the popped event so it’s not lost
                 heapq.heappush(self._event_q, ev)
                 break
     
-            # advance time and accumulate areas
+            # Advance time and accumulate areas for both queues and servers
             dt = ev.time - self.t
             if dt > 0:
-                for sid, st in self.stations.items():
+                for st in self.stations.values():
+                    # Accumulate area for jobs in queues
                     if not hasattr(st, "_ql_area"):
                         st._ql_area = {qid: 0.0 for qid in st.queues}
                     for qid, q in st.queues.items():
                         st._ql_area[qid] += len(q) * dt
+                    
+                    # Accumulate area for jobs in service
+                    if not hasattr(st, "_sl_area"):
+                        st._sl_area = 0.0
+                    num_busy_servers = sum(1 for srv in st.servers if srv.busy)
+                    st._sl_area += num_busy_servers * dt
+
             self.t = ev.time
     
-            # handle event
+            # Handle event
             if ev.type == EventType.ARRIVAL:
                 self._on_arrival(ev.payload["ap"])
             elif ev.type == EventType.DEPARTURE:
@@ -315,9 +386,8 @@ class Network:
             else:
                 raise RuntimeError("Unknown event type")
     
-            # scheduling decision after any state change
+            # Scheduling decision after any state change
             self._decision_epoch()
-
 
     # ---- arrivals, departures ----
 
@@ -773,7 +843,7 @@ class KellyNetwork(Network):
             }
         soj = np.array([j.t_departure - j.t_arrival for j in jobs], dtype=float)
         cls1 = np.array([j.cls == "1" for j in jobs])
-        print(cls1)
+        #False...
         cls2 = np.array([j.cls == "2" for j in jobs])
         cls3 = np.array([j.cls == "3" for j in jobs])
 
@@ -926,6 +996,135 @@ class KellyNetwork(Network):
         plt.show()
 
         return results
+
+
+# In[1]:
+
+
+class ExtendedSixClassNetwork(Network):
+    """
+    "Extended Six-Class Queueing Network" from Figure 4
+    of Dai and Gluzman (2022).
+    """
+    def __init__(self,
+                 policy: SchedulingPolicy,
+                 *,
+                 L: int, # Number of stations
+                 seed: int = 0,
+                 ):
+        if not L >= 2:
+            raise ValueError("L must be an integer >= 2 for this network.")
+        rng = np.random.default_rng(seed)
+        lam = 9.0 / 140.0
+        mu_rates = { 
+            1: 1.0 / 8.0, 2: 1.0 / 2.0, 3: 1.0 / 4.0,
+            4: 1.0 / 6.0, 5: 1.0 / 7.0, 6: 1.0 / 1.0,
+        }
+
+        def service_sampler(job: Job) -> float:
+            class_idx = int(job.cls)
+            key = (class_idx - 1) % 6 + 1
+            rate = mu_rates[key]
+            return rng.exponential(1.0 / rate)
+
+        stations: Dict[str, Station] = {}
+        for i in range(1, L + 1):
+            sid = f"S{i}"
+            station_queues: Dict[str, Queue] = {}
+            for k in range(1, 4):
+                class_id = 3 * (i - 1) + k
+                qid = f"Q{class_id}"
+                station_queues[qid] = Queue(sid, qid)
+            station_servers = [Server(f"{sid}-s0", service_sampler)]
+            stations[sid] = Station(sid, station_queues, station_servers)
+
+        arrival_sampler = lambda: rng.exponential(1.0 / lam)
+        ap1 = ArrivalProcess("S1", "Q1", arrival_sampler, job_class="1")
+        ap3 = ArrivalProcess("S1", "Q3", arrival_sampler, job_class="3")
+
+        class _Router:
+            def route(self, job: Job, station_id: str, t: float) -> Optional[Tuple[str, str]]:
+                station_num = int(station_id.replace("S", ""))
+                class_num = int(job.cls)
+                if station_num < L:
+                    next_class = class_num + 3
+                    next_station = station_num + 1
+                    job.cls = str(next_class)
+                    return (f"S{next_station}", f"Q{next_class}")
+                elif station_num == L:
+                    if class_num == 3 * (L - 1) + 1:
+                        job.cls = "2"
+                        return ("S1", "Q2")
+                    else:
+                        return None
+                return None
+
+        super().__init__(
+            stations=stations,
+            arrivals=[ap1, ap3],
+            router=_Router(),
+            policy=policy,
+            rng=rng,
+        )
+        self._params = dict(L=L, lam=lam, mu_rates=mu_rates)
+
+    # --- Metrics and Experiment Helpers ---
+
+    def run_and_get_batch_means_stats(
+        self,
+        warmup_time: float,
+        num_batches: int,
+        batch_duration: float
+    ) -> Dict[str, Any]:
+        """
+        Runs a simulation with warmup and uses the batch means method to
+        get a stable estimate of the mean number of jobs in the system.
+        """
+        print(f"Running warmup for {warmup_time:.0f} time units...")
+        self.run(until_time=warmup_time)
+        print("Warmup complete. Starting batch means measurement...")
+
+        batch_means = []
+        
+        for i in range(num_batches):
+            # Reset the area counters for queues and servers at the start of the batch
+            for st in self.stations.values():
+                if hasattr(st, "_ql_area"):
+                    st._ql_area = {qid: 0.0 for qid in st.queues}
+                if hasattr(st, "_sl_area"): # NEW
+                    st._sl_area = 0.0       # NEW
+
+            t_batch_start = self.t
+            self.run(until_time=t_batch_start + batch_duration)
+            
+            # Calculate the mean jobs for this batch (queues + servers)
+            total_area_this_batch = 0
+            for st in self.stations.values():
+                if hasattr(st, "_ql_area"):
+                    total_area_this_batch += sum(st._ql_area.values())
+                if hasattr(st, "_sl_area"): # NEW
+                    total_area_this_batch += st._sl_area # NEW
+            
+            mean_jobs_this_batch = total_area_this_batch / batch_duration
+            batch_means.append(mean_jobs_this_batch)
+            
+            # Optional: uncomment to see progress
+            # print(f"Batch {i+1}/{num_batches} complete. Mean jobs: {mean_jobs_this_batch:.3f}")
+
+        # Calculate statistics over the batch means
+        mean_of_means = np.mean(batch_means)
+        std_of_means = np.std(batch_means, ddof=1)
+        
+        # 95% CI half-width using z=1.96 (appropriate for num_batches >= 30)
+        ci_half_width = 1.96 * (std_of_means / np.sqrt(num_batches))
+
+        print("Measurement complete.")
+        return {
+            "mean_jobs_in_system": mean_of_means,
+            "ci_half_width": ci_half_width,
+            "std_dev_of_batch_means": std_of_means,
+            "num_batches": num_batches,
+        }
 
 
 # In[ ]:
