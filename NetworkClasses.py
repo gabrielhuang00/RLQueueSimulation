@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[63]:
+# In[10]:
 
 
 from __future__ import annotations
@@ -163,145 +163,6 @@ class ArrivalProcess:
     def schedule_next(self, t_now: float) -> float:
         self.next_time = t_now + max(0.0, float(self.interarrival_sampler()))
         return self.next_time
-
-
-# -------- Policy interface --------
-
-class SchedulingPolicy:
-    """
-    Centralized policy: at a decision epoch (e.g., after arrivals or a departure),
-    assign jobs to some/all free servers across the network.
-
-    Must return a mapping: (server) -> (queue) from which to take the next job.
-    The simulator will pop a job from that queue and start it on that server.
-    """
-    def decide(
-        self,
-        net: NetworkLike,                  # duck-typed: see Network below
-        t: float,
-        free_servers: List[Tuple[Station, Server]],
-    ) -> Dict[Server, Queue]:
-        raise NotImplementedError
-
-
-class FIFOSysPolicy(SchedulingPolicy):
-    """
-    Greedy: at each decision epoch, for each free server, take from the
-    non-empty queue of its own station in a fixed order (or max length).
-    """
-    
-    def decide(self, net, t, free_servers):
-        assignments: Dict[Server, Queue] = {}
-        for st_id, srvs in free_servers.items():
-            st = net.stations[st_id]
-            used = defaultdict(int)  # virtual pops per queue in this epoch
-            for srv in srvs:
-                best_q, best_time = None, float("inf")
-                for q in st.queues.values():
-                    j = q.peek_n(used[q])       # 0=head, 1=second, ...
-                    if j and j.q_arrival < best_time:
-                        best_q, best_time = q, j.q_arrival
-                if best_q:
-                    assignments[srv] = best_q
-                    used[best_q] += 1
-        return assignments
-
-
-class FIFONetPolicy(SchedulingPolicy):
-    """
-    First-Come, First-Serve (FCFS) Policy - System-Wide.
-    At each decision epoch, for each free server, this policy assigns the job
-    that has been in the entire system the longest. This is determined by the
-    job's original network entry time (t_arrival).
-    """
-    
-    def decide(self, net, t, free_servers):
-        assignments: Dict[Server, Queue] = {}
-        for st_id, srvs in free_servers.items():
-            st = net.stations[st_id]
-            used = defaultdict(int)  # virtual pops per queue in this epoch
-            for srv in srvs:
-                best_q, best_time = None, float("inf")
-                for q in st.queues.values():
-                    j = q.peek_n(used[q])
-                    # THE ONLY CHANGE IS HERE: use j.t_arrival instead of j.q_arrival
-                    if j and j.t_arrival < best_time:
-                        best_q, best_time = q, j.t_arrival
-                if best_q:
-                    assignments[srv] = best_q
-                    used[best_q] += 1
-        return assignments
-
-
-class MaxWeightByQLenPolicy(SchedulingPolicy):
-    """
-    Station-local MaxWeight: for each free server at a station,
-    assign it to the nonempty queue with the largest length.
-    """
-    def decide(self, net, t, free_servers):
-        assignments: Dict[Server, Queue] = {}
-        for st_id, srvs in free_servers.items():
-            station = net.stations[st_id]
-
-            # initialize queue lengths
-            queue_lengths = {qid: len(q) for qid, q in station.queues.items() if len(q) > 0}
-            if not queue_lengths:
-                continue
-
-            for srv in srvs:
-                if not queue_lengths:  # all empty now
-                    break
-
-                # pick the queue_id with the largest length
-                qid = max(queue_lengths, key=queue_lengths.get)
-                assignments[srv] = station.queues[qid]
-
-                # virtually consume one job from that queue
-                queue_lengths[qid] -= 1
-                if queue_lengths[qid] <= 0:
-                    del queue_lengths[qid]
-
-        return assignments
-
-class LBFSPolicy(SchedulingPolicy):
-    """
-    Last-Buffer First-Serve (LBFS) Policy.
-    At each station, this policy gives static priority to the non-empty queue
-    with the highest class index.
-    """
-    def decide(self, net: Network, t: float, free_servers: Dict[str, List[Server]]) -> Dict[Server, Queue]:
-        assignments: Dict[Server, Queue] = {}
-        for st_id, srvs in free_servers.items():
-            station = net.stations[st_id]
-
-            # Find the best non-empty queue based on the highest class index
-            best_q: Optional[Queue] = None
-            max_cls_id = -1
-
-            for q in station.queues.values():
-                if len(q) > 0:
-                    # Parse class ID from queue ID (e.g., "Q7" -> 7)
-                    try:
-                        cls_id = int(q.queue_id.replace("Q", ""))
-                        if cls_id > max_cls_id:
-                            max_cls_id = cls_id
-                            best_q = q
-                    except ValueError:
-                        # Handle non-numeric queue IDs if they exist
-                        continue
-            
-            # If a priority queue was found, assign all free servers to it
-            if best_q:
-                # Keep track of jobs assigned from the best queue in this epoch
-                jobs_to_assign = len(best_q)
-                for srv in srvs:
-                    if jobs_to_assign > 0:
-                        assignments[srv] = best_q
-                        jobs_to_assign -= 1
-                    else:
-                        break # No more jobs in the priority queue
-                        
-        return assignments
 
 # -------- Network (orchestrator) --------
 
@@ -470,6 +331,13 @@ class Network:
     def mean_sojourn(self) -> float:
         return self.sum_sojourn / self.completed_jobs if self.completed_jobs else float("nan")
 
+    def mu_for_queue_id(self, qid: str) -> float:
+        """
+        Map 'Qk' -> the μ associated to class k via your modulo-6 rule.
+        """
+        k = int(qid[1:])                         # 'Q7' -> 7
+        key = ((k - 1) % 6) + 1                  # 1..6
+        return self._params["mu_rates"][key]
 
 # -------- Utility samplers (Exp arrivals/services) --------
 
@@ -482,7 +350,181 @@ def exp_service(mu: float, rng: np.random.Generator) -> Callable[[Job], float]:
     return lambda job: rng.exponential(1.0 / mu)
 
 
-# In[47]:
+# In[11]:
+
+
+# -------- Policy interface --------
+
+class SchedulingPolicy:
+    """
+    Centralized policy: at a decision epoch (e.g., after arrivals or a departure),
+    assign jobs to some/all free servers across the network.
+
+    Must return a mapping: (server) -> (queue) from which to take the next job.
+    The simulator will pop a job from that queue and start it on that server.
+    """
+    def decide(
+        self,
+        net: NetworkLike,                  # duck-typed: see Network below
+        t: float,
+        free_servers: List[Tuple[Station, Server]],
+    ) -> Dict[Server, Queue]:
+        raise NotImplementedError
+
+
+class FIFOSysPolicy(SchedulingPolicy):
+    """
+    Greedy: at each decision epoch, for each free server, take from the
+    non-empty queue of its own station in a fixed order (or max length).
+    """
+    
+    def decide(self, net, t, free_servers):
+        assignments: Dict[Server, Queue] = {}
+        for st_id, srvs in free_servers.items():
+            st = net.stations[st_id]
+            used = defaultdict(int)  # virtual pops per queue in this epoch
+            for srv in srvs:
+                best_q, best_time = None, float("inf")
+                for q in st.queues.values():
+                    j = q.peek_n(used[q])       # 0=head, 1=second, ...
+                    if j and j.q_arrival < best_time:
+                        best_q, best_time = q, j.q_arrival
+                if best_q:
+                    assignments[srv] = best_q
+                    used[best_q] += 1
+        return assignments
+
+
+class FIFONetPolicy(SchedulingPolicy):
+    """
+    First-Come, First-Serve (FCFS) Policy - System-Wide.
+    At each decision epoch, for each free server, this policy assigns the job
+    that has been in the entire system the longest. This is determined by the
+    job's original network entry time (t_arrival).
+    """
+    
+    def decide(self, net, t, free_servers):
+        assignments: Dict[Server, Queue] = {}
+        for st_id, srvs in free_servers.items():
+            st = net.stations[st_id]
+            used = defaultdict(int)  # virtual pops per queue in this epoch
+            for srv in srvs:
+                best_q, best_time = None, float("inf")
+                for q in st.queues.values():
+                    j = q.peek_n(used[q])
+                    # THE ONLY CHANGE IS HERE: use j.t_arrival instead of j.q_arrival
+                    if j and j.t_arrival < best_time:
+                        best_q, best_time = q, j.t_arrival
+                if best_q:
+                    assignments[srv] = best_q
+                    used[best_q] += 1
+        return assignments
+
+
+class MaxWeightByQLenPolicy(SchedulingPolicy):
+    """
+    Station-local MaxWeight: for each free server at a station,
+    assign it to the nonempty queue with the largest length.
+    """
+    def decide(self, net, t, free_servers):
+        assignments: Dict[Server, Queue] = {}
+        for st_id, srvs in free_servers.items():
+            station = net.stations[st_id]
+
+            # initialize queue lengths
+            queue_lengths = {qid: len(q) for qid, q in station.queues.items() if len(q) > 0}
+            if not queue_lengths:
+                continue
+
+            for srv in srvs:
+                if not queue_lengths:  # all empty now
+                    break
+
+                # pick the queue_id with the largest length
+                qid = max(queue_lengths, key=queue_lengths.get)
+                assignments[srv] = station.queues[qid]
+
+                # virtually consume one job from that queue
+                queue_lengths[qid] -= 1
+                if queue_lengths[qid] <= 0:
+                    del queue_lengths[qid]
+
+        return assignments
+
+# ---- Policy: MaxWeight with h_j ≡ 1 (Che) ----
+class MaxWeightChePolicy(SchedulingPolicy):
+    """
+    For each free server at a station, pick q* = argmax_j μ_ij * x_j  among queues
+    that server can serve (here: the 3 local queues).
+    """
+    def decide(self, net, t, free_servers):
+        assignments: Dict[Server, Queue] = {}
+        for st_id, srvs in free_servers.items():
+            st = net.stations[st_id]
+
+            # Start from current queue lengths
+            # and greedily allocate several servers at this station if needed.
+            eff = { qid: (len(q), net.mu_for_queue_id(qid))
+                    for qid, q in st.queues.items() if len(q) > 0 }
+
+            for srv in srvs:
+                if not eff:
+                    break
+                # argmax over μ * x
+                qid_star = max(eff, key=lambda qid: eff[qid][0] * eff[qid][1])
+                assignments[srv] = st.queues[qid_star]
+                # Virtually consume one job from that queue for the next free server
+                x, mu = eff[qid_star]
+                x -= 1
+                if x <= 0:
+                    del eff[qid_star]
+                else:
+                    eff[qid_star] = (x, mu)
+        return assignments
+
+
+class LBFSPolicy(SchedulingPolicy):
+    """
+    Last-Buffer First-Serve (LBFS) Policy.
+    At each station, this policy gives static priority to the non-empty queue
+    with the highest class index.
+    """
+    def decide(self, net: Network, t: float, free_servers: Dict[str, List[Server]]) -> Dict[Server, Queue]:
+        assignments: Dict[Server, Queue] = {}
+        for st_id, srvs in free_servers.items():
+            station = net.stations[st_id]
+
+            # Find the best non-empty queue based on the highest class index
+            best_q: Optional[Queue] = None
+            max_cls_id = -1
+
+            for q in station.queues.values():
+                if len(q) > 0:
+                    # Parse class ID from queue ID (e.g., "Q7" -> 7)
+                    try:
+                        cls_id = int(q.queue_id.replace("Q", ""))
+                        if cls_id > max_cls_id:
+                            max_cls_id = cls_id
+                            best_q = q
+                    except ValueError:
+                        # Handle non-numeric queue IDs if they exist
+                        continue
+            
+            # If a priority queue was found, assign all free servers to it
+            if best_q:
+                # Keep track of jobs assigned from the best queue in this epoch
+                jobs_to_assign = len(best_q)
+                for srv in srvs:
+                    if jobs_to_assign > 0:
+                        assignments[srv] = best_q
+                        jobs_to_assign -= 1
+                    else:
+                        break # No more jobs in the priority queue
+                        
+        return assignments
+
+
+# In[7]:
 
 
 # ----------------- CrissCross subclass -----------------
@@ -998,7 +1040,7 @@ class KellyNetwork(Network):
         return results
 
 
-# In[1]:
+# In[15]:
 
 
 class ExtendedSixClassNetwork(Network):
@@ -1074,55 +1116,74 @@ class ExtendedSixClassNetwork(Network):
         self,
         warmup_time: float,
         num_batches: int,
-        batch_duration: float
+        batch_duration: float,
+        include_service: bool = True, 
     ) -> Dict[str, Any]:
         """
-        Runs a simulation with warmup and uses the batch means method to
-        get a stable estimate of the mean number of jobs in the system.
+        Batch-means estimator. Returns both queue-only and system (queues+service)
+        metrics, and remains backward-compatible with older callers that expect
+        'mean_jobs_in_system' and 'ci_half_width'.
+        - include_service=False: reported_mean == queue-only (Che-style)
+        - include_service=True:  reported_mean == system size (legacy)
         """
         print(f"Running warmup for {warmup_time:.0f} time units...")
-        self.run(until_time=warmup_time)
+        self.run(until_time=self.t + warmup_time)
         print("Warmup complete. Starting batch means measurement...")
-
-        batch_means = []
-        
-        for i in range(num_batches):
-            # Reset the area counters for queues and servers at the start of the batch
+    
+        batch_means_queue: List[float] = []
+        batch_means_system: List[float] = []
+    
+        for _ in range(num_batches):
+            # reset areas
             for st in self.stations.values():
-                if hasattr(st, "_ql_area"):
-                    st._ql_area = {qid: 0.0 for qid in st.queues}
-                if hasattr(st, "_sl_area"): # NEW
-                    st._sl_area = 0.0       # NEW
-
-            t_batch_start = self.t
-            self.run(until_time=t_batch_start + batch_duration)
-            
-            # Calculate the mean jobs for this batch (queues + servers)
-            total_area_this_batch = 0
+                st._ql_area = {qid: 0.0 for qid in st.queues}
+                st._sl_area = 0.0
+    
+            t0 = self.t
+            self.run(until_time=t0 + batch_duration)
+            elapsed = max(1e-12, self.t - t0)  # robust to tiny tails
+    
+            q_area = 0.0
+            s_area = 0.0
             for st in self.stations.values():
-                if hasattr(st, "_ql_area"):
-                    total_area_this_batch += sum(st._ql_area.values())
-                if hasattr(st, "_sl_area"): # NEW
-                    total_area_this_batch += st._sl_area # NEW
-            
-            mean_jobs_this_batch = total_area_this_batch / batch_duration
-            batch_means.append(mean_jobs_this_batch)
-            
-            # Optional: uncomment to see progress
-            # print(f"Batch {i+1}/{num_batches} complete. Mean jobs: {mean_jobs_this_batch:.3f}")
+                q_area += sum(st._ql_area.values())
+                s_area += st._sl_area
+    
+            batch_means_queue.append(q_area / elapsed)
+            batch_means_system.append((q_area + s_area) / elapsed)
+    
+        def agg(arr: List[float]) -> Tuple[float, float, float]:
+            m = float(np.mean(arr))
+            sd = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
+            ci = 1.96 * sd / math.sqrt(len(arr)) if len(arr) > 1 else 0.0
+            return m, sd, ci
 
-        # Calculate statistics over the batch means
-        mean_of_means = np.mean(batch_means)
-        std_of_means = np.std(batch_means, ddof=1)
-        
-        # 95% CI half-width using z=1.96 (appropriate for num_batches >= 30)
-        ci_half_width = 1.96 * (std_of_means / np.sqrt(num_batches))
-
+        mean_q, sd_q, ci_q = agg(batch_means_queue)
+        mean_sys, sd_sys, ci_sys = agg(batch_means_system)
+    
+        # Choose which to "report" based on include_service
+        reported_mean = mean_sys if include_service else mean_q
+        reported_ci   = ci_sys   if include_service else ci_q
+    
         print("Measurement complete.")
         return {
-            "mean_jobs_in_system": mean_of_means,
-            "ci_half_width": ci_half_width,
-            "std_dev_of_batch_means": std_of_means,
+            # ---- Backward-compat (legacy callers) ----
+            "mean_jobs_in_system": mean_sys,      # legacy: system (queues+service)
+            "ci_half_width": ci_sys,              # legacy CI corresponds to system
+    
+            # ---- Explicit metrics ----
+            "mean_queue_only": mean_q,
+            "ci_half_width_queue": ci_q,
+            "std_dev_of_batch_means_queue": sd_q,
+    
+            "mean_system": mean_sys,
+            "ci_half_width_system": ci_sys,
+            "std_dev_of_batch_means_system": sd_sys,
+    
+            # ---- What the caller *asked for* in this invocation ----
+            "reported_mean": reported_mean,
+            "reported_ci_half_width": reported_ci,
+            "metric": "queues+service (system)" if include_service else "queues_only",
             "num_batches": num_batches,
         }
 
