@@ -82,16 +82,16 @@ class MCTSPolicy(SchedulingPolicy):
             if not current.is_fully_expanded():
                 return self._expand(current, net, free_servers)
             
-            # If fully expanded, select best child using UCB
+            # If fully expanded, select best child using UTC
             if not current.children:
                 return current
             
-            current = self._ucb_select(current)
+            current = self._utc_select(current)
         
         return current
-    
-    def _ucb_select(self, node: MCTSNode) -> MCTSNode:
-        """UCB1 function for child selection"""
+
+    def _utc_select(self, node: MCTSNode) -> MCTSNode:
+        """UTC1 function for child selection"""
         best_score = float('-inf')
         best_child = None
         
