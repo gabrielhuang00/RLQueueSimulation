@@ -314,7 +314,6 @@ class Network:
     # ---- arrivals, departures ----
 
     def _on_arrival(self, ap: ArrivalProcess) -> None:
-        # [THIS METHOD IS UNCHANGED]
         job = Job(id=self._next_job_id(), cls=ap.job_class, t_arrival=self.t, q_arrival = self.t)
         st = self.stations[ap.station_id]
         q = st.queues[ap.queue_id]
@@ -325,7 +324,6 @@ class Network:
         self.schedule(t_next, EventType.ARRIVAL, {"ap": ap})
     
     def _on_departure(self, station_id: str, server_idx: int) -> None:
-        # [THIS METHOD IS UNCHANGED]
         st = self.stations[station_id]
         srv = st.servers[server_idx]
         job = srv.complete(self.t)
@@ -431,7 +429,7 @@ class Network:
         # 5. Copy all metric attributes
         new_net.completed_jobs = self.completed_jobs
         new_net.sum_sojourn = self.sum_sojourn
-        new_net.exited_jobs = [job.clone() for job in self.exited_jobs]
+        new_net.exited_jobs = []
         
         # (Station-level metric areas were copied in station.clone())
         
@@ -508,7 +506,7 @@ def exp_service(mu: float, rng: np.random.Generator) -> Callable[[Job], float]:
     return lambda job: rng.exponential(1.0 / mu)
 
 
-# In[5]:
+# In[12]:
 
 
 # -------- Policy Implementations --------
@@ -613,6 +611,7 @@ class LBFSPolicy(SchedulingPolicy):
                         jobs_to_assign -= 1
                     else:
                         break
+        return assignments
 
 
 # In[6]:
@@ -761,6 +760,101 @@ class ExtendedSixClassNetwork(Network):
             "metric": "queues+service (system)" if include_service else "queues_only",
             "num_batches": num_batches,
         }
+
+
+# In[29]:
+
+
+policy = LBFSPolicy()
+net = ExtendedSixClassNetwork(policy=policy,L=2,seed=1)
+results = net.run_and_get_batch_means_stats(
+        warmup_time=1000.0,
+        num_batches=50,
+        batch_duration=50000.0
+    )
+print("\n--- Final Simulation Results ---")
+print(f"Mean number of jobs in system: {results['mean_jobs_in_system']:.3f}")
+print(f"95% Confidence Interval: +/- {results['ci_half_width']:.3f}")
+print(f"Result: {results['mean_jobs_in_system']:.3f} ± {results['ci_half_width']:.3f}")
+print("\n")
+
+
+# In[37]:
+
+
+# --- Helper to calculate System Size from a Network object ---
+def calculate_mean_system_size(net: Network) -> float:
+ """
+ Calculates the time-averaged number of jobs in the system.
+ Formula: (Integral of Q(t) + S(t)) / Total Time
+ """
+ total_area = 0.0
+ 
+ # Sum area of all queues and servers across all stations
+ for st in net.stations.values():
+     # Add Queue Area (waiting jobs * time)
+     total_area += sum(st._ql_area.values())
+     # Add Service Area (busy servers * time)
+     total_area += st._sl_area
+     
+ elapsed_time = max(net.t, 1e-12) # Avoid division by zero
+ return total_area / elapsed_time
+ 
+system_sizes = []
+total_completed = 0
+for i in range(10):
+ net = ExtendedSixClassNetwork(
+     policy=policy,
+     L=2,
+     seed=random.randint(100000, 999999)
+ )
+ 
+ if not net._seeded:
+     for ap in net.arrivals:
+         t_next = ap.schedule_next(net.t)
+         net.schedule(t_next, EventType.ARRIVAL, {"ap": ap})
+     net._seeded = True
+ 
+ 
+ while net._event_q:
+     if net._event_q[0].time > 120000:
+         break
+
+     ev = heapq.heappop(net._event_q)
+     
+     dt = ev.time - net.t
+     if dt > 0:
+         for st in net.stations.values():
+             for qid, q in st.queues.items():
+                 st._ql_area[qid] += len(q) * dt
+             num_busy = sum(1 for srv in st.servers if srv.busy)
+             st._sl_area += num_busy * dt
+     net.t = ev.time
+
+     if ev.type == EventType.ARRIVAL:
+         net._on_arrival(ev.payload["ap"])
+     elif ev.type == EventType.DEPARTURE:
+         net._on_departure(ev.payload["station_id"], ev.payload["server_idx"])
+
+     free_servers = net._get_free_servers()
+     while free_servers:
+         assignments = net.policy.decide(net, net.t, free_servers)
+         if not assignments: break
+         for srv, q in assignments.items():
+             if len(q) == 0 or srv.busy: continue
+             job = q.pop()
+             srv.start_service(job, net.t)
+             st_id = q.station_id
+             server_idx = net.stations[st_id].servers.index(srv)
+             net.schedule(net.t + srv.service_sampler(job), EventType.DEPARTURE, {"station_id": st_id, "server_idx": server_idx})
+         free_servers = net._get_free_servers()
+ 
+ # --- Calculate System Size ---
+ mean_sys_size = calculate_mean_system_size(net)
+ system_sizes.append(mean_sys_size)
+ 
+ total_completed += net.completed_jobs
+ print(f"  Eval Episode {i+1}: Mean System Size = {mean_sys_size:.4f}, Jobs = {net.completed_jobs}")
 
 
 # In[ ]:
