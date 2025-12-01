@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[7]:
+# In[4]:
 
 
 from __future__ import annotations
@@ -506,7 +506,7 @@ def exp_service(mu: float, rng: np.random.Generator) -> Callable[[Job], float]:
     return lambda job: rng.exponential(1.0 / mu)
 
 
-# In[12]:
+# In[5]:
 
 
 # -------- Policy Implementations --------
@@ -617,6 +617,62 @@ class LBFSPolicy(SchedulingPolicy):
 # In[6]:
 
 
+class ExtendedServiceSampler:
+    """
+    A lightweight callable object that handles service times.
+    Replaces 'self.service_sampler' to avoid memory leaks during pickling.
+    """
+    def __init__(self, rng: np.random.Generator):
+        self.rng = rng
+        self.mu_rates = { 
+            1: 1.0 / 8.0, 2: 1.0 / 2.0, 3: 1.0 / 4.0,
+            4: 1.0 / 6.0, 5: 1.0 / 7.0, 6: 1.0 / 1.0,
+        }
+
+    def __call__(self, job: Job) -> float:
+        class_idx = int(job.cls)
+        # Map class to rate key (1..6)
+        key = (class_idx - 1) % 6 + 1
+        rate = self.mu_rates[key]
+        return self.rng.exponential(1.0 / rate)
+
+class ExtendedArrivalSampler:
+    """
+    A lightweight callable object that handles arrival times.
+    """
+    def __init__(self, rng: np.random.Generator, lam: float):
+        self.rng = rng
+        self.lam = lam
+
+    def __call__(self) -> float:
+        return self.rng.exponential(1.0 / self.lam)
+
+class ExtendedSixClassRouter:
+    """
+    A standalone router class.
+    """
+    def __init__(self, L: int):
+        self.L = L
+
+    def route(self, job: Job, station_id: str, t: float) -> Optional[Tuple[str, str]]:
+        station_num = int(station_id.replace("S", ""))
+        class_num = int(job.cls)
+        
+        if station_num < self.L:
+            next_class = class_num + 3
+            next_station = station_num + 1
+            job.cls = str(next_class)
+            return (f"S{next_station}", f"Q{next_class}")
+        elif station_num == self.L:
+            if class_num == 3 * (self.L - 1) + 1:
+                job.cls = "2"
+                return ("S1", "Q2")
+            else:
+                return None
+        return None
+
+# --- 2. The Fixed Network Class ---
+
 class ExtendedSixClassNetwork(Network):
     """
     "Extended Six-Class Queueing Network" from Figure 4
@@ -630,18 +686,16 @@ class ExtendedSixClassNetwork(Network):
                  ):
         if not L >= 2:
             raise ValueError("L must be an integer >= 2 for this network.")
+        
+        # Create a dedicated RNG
         rng = np.random.default_rng(seed)
         lam = 9.0 / 140.0
-        mu_rates = { 
-            1: 1.0 / 8.0, 2: 1.0 / 2.0, 3: 1.0 / 4.0,
-            4: 1.0 / 6.0, 5: 1.0 / 7.0, 6: 1.0 / 1.0,
-        }
-
-        def service_sampler(job: Job) -> float:
-            class_idx = int(job.cls)
-            key = (class_idx - 1) % 6 + 1
-            rate = mu_rates[key]
-            return rng.exponential(1.0 / rate)
+        
+        # --- Create Standalone Samplers ---
+        # We pass these to Servers/Arrivals instead of 'self.method'
+        # This breaks the reference cycle to the Network object.
+        svc_sampler = ExtendedServiceSampler(rng)
+        arr_sampler = ExtendedArrivalSampler(rng, lam)
 
         stations: Dict[str, Station] = {}
         for i in range(1, L + 1):
@@ -651,41 +705,28 @@ class ExtendedSixClassNetwork(Network):
                 class_id = 3 * (i - 1) + k
                 qid = f"Q{class_id}"
                 station_queues[qid] = Queue(sid, qid)
-            station_servers = [Server(f"{sid}-s0", service_sampler)]
+            
+            # Pass the functor object, NOT a bound method
+            station_servers = [Server(f"{sid}-s0", svc_sampler)]
             stations[sid] = Station(sid, station_queues, station_servers)
 
-        arrival_sampler = lambda: rng.exponential(1.0 / lam)
-        ap1 = ArrivalProcess("S1", "Q1", arrival_sampler, job_class="1")
-        ap3 = ArrivalProcess("S1", "Q3", arrival_sampler, job_class="3")
+        # Pass the functor object
+        ap1 = ArrivalProcess("S1", "Q1", arr_sampler, job_class="1")
+        ap3 = ArrivalProcess("S1", "Q3", arr_sampler, job_class="3")
 
-        class _Router:
-            def route(self, job: Job, station_id: str, t: float) -> Optional[Tuple[str, str]]:
-                station_num = int(station_id.replace("S", ""))
-                class_num = int(job.cls)
-                if station_num < L:
-                    next_class = class_num + 3
-                    next_station = station_num + 1
-                    job.cls = str(next_class)
-                    return (f"S{next_station}", f"Q{next_class}")
-                elif station_num == L:
-                    if class_num == 3 * (L - 1) + 1:
-                        job.cls = "2"
-                        return ("S1", "Q2")
-                    else:
-                        return None
-                return None
+        # Pass the router object
+        router = ExtendedSixClassRouter(L)
 
         super().__init__(
             stations=stations,
             arrivals=[ap1, ap3],
-            router=_Router(),
+            router=router,
             policy=policy,
             rng=rng,
         )
-        self._params = dict(L=L, lam=lam, mu_rates=mu_rates)
+        self._params = dict(L=L, lam=lam, mu_rates=svc_sampler.mu_rates)
 
-    # --- Metrics and Experiment Helpers ---
-
+    # --- Metrics Helper (Unchanged) ---
     def run_and_get_batch_means_stats(
         self,
         warmup_time: float,
@@ -693,19 +734,12 @@ class ExtendedSixClassNetwork(Network):
         batch_duration: float,
         include_service: bool = True, 
     ) -> Dict[str, Any]:
-        """
-        Batch-means estimator. Returns both queue-only and system (queues+service)
-        metrics, and remains backward-compatible with older callers that expect
-        'mean_jobs_in_system' and 'ci_half_width'.
-        - include_service=False: reported_mean == queue-only (Che-style)
-        - include_service=True:  reported_mean == system size (legacy)
-        """
         print(f"Running warmup for {warmup_time:.0f} time units...")
         self.run(until_time=self.t + warmup_time)
         print("Warmup complete. Starting batch means measurement...")
     
-        batch_means_queue: List[float] = []
-        batch_means_system: List[float] = []
+        batch_means_queue = []
+        batch_means_system = []
     
         for _ in range(num_batches):
             # reset areas
@@ -715,7 +749,7 @@ class ExtendedSixClassNetwork(Network):
     
             t0 = self.t
             self.run(until_time=t0 + batch_duration)
-            elapsed = max(1e-12, self.t - t0)  # robust to tiny tails
+            elapsed = max(1e-12, self.t - t0)
     
             q_area = 0.0
             s_area = 0.0
@@ -726,7 +760,7 @@ class ExtendedSixClassNetwork(Network):
             batch_means_queue.append(q_area / elapsed)
             batch_means_system.append((q_area + s_area) / elapsed)
     
-        def agg(arr: List[float]) -> Tuple[float, float, float]:
+        def agg(arr):
             m = float(np.mean(arr))
             sd = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
             ci = 1.96 * sd / math.sqrt(len(arr)) if len(arr) > 1 else 0.0
@@ -735,126 +769,17 @@ class ExtendedSixClassNetwork(Network):
         mean_q, sd_q, ci_q = agg(batch_means_queue)
         mean_sys, sd_sys, ci_sys = agg(batch_means_system)
     
-        # Choose which to "report" based on include_service
         reported_mean = mean_sys if include_service else mean_q
         reported_ci   = ci_sys   if include_service else ci_q
     
         print("Measurement complete.")
         return {
-            # ---- Backward-compat (legacy callers) ----
-            "mean_jobs_in_system": mean_sys,      # legacy: system (queues+service)
-            "ci_half_width": ci_sys,              # legacy CI corresponds to system
-    
-            # ---- Explicit metrics ----
-            "mean_queue_only": mean_q,
-            "ci_half_width_queue": ci_q,
-            "std_dev_of_batch_means_queue": sd_q,
-    
-            "mean_system": mean_sys,
-            "ci_half_width_system": ci_sys,
-            "std_dev_of_batch_means_system": sd_sys,
-    
-            # ---- What the caller *asked for* in this invocation ----
+            "mean_jobs_in_system": mean_sys,
+            "ci_half_width": ci_sys,
             "reported_mean": reported_mean,
             "reported_ci_half_width": reported_ci,
-            "metric": "queues+service (system)" if include_service else "queues_only",
             "num_batches": num_batches,
         }
-
-
-# In[29]:
-
-
-policy = LBFSPolicy()
-net = ExtendedSixClassNetwork(policy=policy,L=2,seed=1)
-results = net.run_and_get_batch_means_stats(
-        warmup_time=1000.0,
-        num_batches=50,
-        batch_duration=50000.0
-    )
-print("\n--- Final Simulation Results ---")
-print(f"Mean number of jobs in system: {results['mean_jobs_in_system']:.3f}")
-print(f"95% Confidence Interval: +/- {results['ci_half_width']:.3f}")
-print(f"Result: {results['mean_jobs_in_system']:.3f} ± {results['ci_half_width']:.3f}")
-print("\n")
-
-
-# In[37]:
-
-
-# --- Helper to calculate System Size from a Network object ---
-def calculate_mean_system_size(net: Network) -> float:
- """
- Calculates the time-averaged number of jobs in the system.
- Formula: (Integral of Q(t) + S(t)) / Total Time
- """
- total_area = 0.0
- 
- # Sum area of all queues and servers across all stations
- for st in net.stations.values():
-     # Add Queue Area (waiting jobs * time)
-     total_area += sum(st._ql_area.values())
-     # Add Service Area (busy servers * time)
-     total_area += st._sl_area
-     
- elapsed_time = max(net.t, 1e-12) # Avoid division by zero
- return total_area / elapsed_time
- 
-system_sizes = []
-total_completed = 0
-for i in range(10):
- net = ExtendedSixClassNetwork(
-     policy=policy,
-     L=2,
-     seed=random.randint(100000, 999999)
- )
- 
- if not net._seeded:
-     for ap in net.arrivals:
-         t_next = ap.schedule_next(net.t)
-         net.schedule(t_next, EventType.ARRIVAL, {"ap": ap})
-     net._seeded = True
- 
- 
- while net._event_q:
-     if net._event_q[0].time > 120000:
-         break
-
-     ev = heapq.heappop(net._event_q)
-     
-     dt = ev.time - net.t
-     if dt > 0:
-         for st in net.stations.values():
-             for qid, q in st.queues.items():
-                 st._ql_area[qid] += len(q) * dt
-             num_busy = sum(1 for srv in st.servers if srv.busy)
-             st._sl_area += num_busy * dt
-     net.t = ev.time
-
-     if ev.type == EventType.ARRIVAL:
-         net._on_arrival(ev.payload["ap"])
-     elif ev.type == EventType.DEPARTURE:
-         net._on_departure(ev.payload["station_id"], ev.payload["server_idx"])
-
-     free_servers = net._get_free_servers()
-     while free_servers:
-         assignments = net.policy.decide(net, net.t, free_servers)
-         if not assignments: break
-         for srv, q in assignments.items():
-             if len(q) == 0 or srv.busy: continue
-             job = q.pop()
-             srv.start_service(job, net.t)
-             st_id = q.station_id
-             server_idx = net.stations[st_id].servers.index(srv)
-             net.schedule(net.t + srv.service_sampler(job), EventType.DEPARTURE, {"station_id": st_id, "server_idx": server_idx})
-         free_servers = net._get_free_servers()
- 
- # --- Calculate System Size ---
- mean_sys_size = calculate_mean_system_size(net)
- system_sizes.append(mean_sys_size)
- 
- total_completed += net.completed_jobs
- print(f"  Eval Episode {i+1}: Mean System Size = {mean_sys_size:.4f}, Jobs = {net.completed_jobs}")
 
 
 # In[ ]:
