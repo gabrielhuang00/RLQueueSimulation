@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[5]:
+# In[3]:
 
 
 from __future__ import annotations
@@ -37,8 +37,8 @@ CONFIG = {
     
     # --- NN & Training ---
     "learning_rate": 0.001,
-    "buffer_size": 50000,
-    "batch_size": 64,
+    "buffer_size": 200000,
+    "batch_size": 256, #Experiment with
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 
     # --- MCTS ---
@@ -52,8 +52,8 @@ CONFIG = {
     # --- Training Loop ---
     "num_train_loops": 100,
     "episodes_per_loop": 50,      # Generate 50 sim runs
-    "train_steps_per_loop": 100,  # Train 100 times
-    "sim_run_duration": 5000.0,    # Run each "real" sim for Xs
+    "train_steps_per_loop": 200,  # ML Epochs
+    "sim_run_duration": 10000.0,    # Run each "real" sim for Xs
     "CATASTROPHE_SOJOURN_TIME": 80.0, # The "worst" score for normalization
     "seed": 1
 }
@@ -604,26 +604,6 @@ class Trainer:
             self.replay_buffer.push(state, policy_target, final_outcome_z)
             
         return final_outcome_z, mean_sojourn
-  # --- Updated Reward Function (For Training) ---
-    # Use to optimize for System Size specifically
-    def get_final_outcome(self, net: Network) -> Tuple[float, float]:
-        """
-        Returns (normalized_score, raw_metric).
-        Metric is MEAN SYSTEM SIZE.
-        """
-        # 1. Calculate raw metric
-        mean_sys_size = calculate_mean_system_size(net)
-        
-        # 2. Normalize
-        # Note: You might need to adjust CATASTROPHE_SOJOURN_TIME in config 
-        # to be a reasonable 'max system size' (e.g., 50 or 100 jobs)
-        catastrophe_val = self.config["CATASTROPHE_SOJOURN_TIME"] 
-        
-        clipped_val = np.clip(mean_sys_size, 0, catastrophe_val)
-        scaled_val = clipped_val / catastrophe_val
-        final_score = 1.0 - (2.0 * scaled_val)
-        
-        return float(final_score), mean_sys_size
 
     def train_step(self) -> Optional[float]:
         """Samples a batch and performs one backprop step."""
@@ -725,9 +705,6 @@ class Trainer:
             
             if train_steps > 0:
                 print(f"  Avg Loss: {avg_loss / train_steps:.4f}")
-            
-            if (i+1) % 10 == 0:
-                self.save_model(f"model_loop_{i+1}.pth")
     
        # --- Helper to calculate System Size from a Network object ---
     def calculate_mean_system_size(self, net: Network) -> float:

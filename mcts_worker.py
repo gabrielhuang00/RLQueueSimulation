@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[3]:
+# In[1]:
 
 
 import torch
@@ -71,7 +71,7 @@ def run_episode_worker(args):
     # 3. Run Event Loop using RELATIVE TIME
     # We run until 'start_time + duration'
     end_time = start_time + local_config["sim_run_duration"]
-
+    decisions_in_episode = 0
     while net._event_q:
         # Check against the relative end time
         if net.t > end_time:
@@ -97,9 +97,11 @@ def run_episode_worker(args):
         free_servers = net._get_free_servers()
         while free_servers:
             assignments, root, state_vec = local_policy.decide(net, net.t, free_servers)
-            
-            policy_target = local_policy.get_policy_target(root, local_config["temperature"])
-            episode_history.append((state_vec, policy_target))
+            if decisions_in_episode % 10 == 0: 
+                policy_target = local_policy.get_policy_target(root, local_config["temperature"])
+                episode_history.append((state_vec, policy_target))
+                
+            decisions_in_episode += 1
             
             if not assignments: break
             
@@ -115,13 +117,18 @@ def run_episode_worker(args):
     # 4. Calculate Results
     # Calculate duration relative to this specific episode
     elapsed = max(net.t - start_time, 1e-12)
-    
     total_area = sum(sum(st._ql_area.values()) + st._sl_area for st in net.stations.values())
     mean_sys_size = total_area / elapsed
     
+    # Log-Space Normalization (Matches mcts_model.py)
     cat_val = local_config["CATASTROPHE_SOJOURN_TIME"]
-    clipped = np.clip(mean_sys_size, 0, cat_val)
-    final_score = 1.0 - (2.0 * (clipped / cat_val))
+    
+    # Log Transform: log(1 + L)
+    log_val = np.log1p(mean_sys_size)
+    ref_log = np.log1p(cat_val)
+    
+    # Soft Normalization (No hard clip)
+    final_score = 1.0 - (2.0 * (log_val / ref_log))
     
     return episode_history, float(final_score), mean_sys_size
 
