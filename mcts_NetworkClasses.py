@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[4]:
+# In[1]:
 
 
 from __future__ import annotations
@@ -13,8 +13,8 @@ import heapq
 import math
 import numpy as np
 from collections import defaultdict
-import copy # <-- ADDED FOR CLONING
-import matplotlib.pyplot as plt # <-- Included from your file
+import copy 
+import matplotlib.pyplot as plt # 
 
 # -------- Events --------
 
@@ -388,7 +388,7 @@ class Network:
         return out
 
     def mean_sojourn(self) -> float:
-        return self.sum_sojourn / self.completed_jobs if self.completed_jobs else float("nan")
+        return self.completed_jobs / self.sum_sojourn if self.completed_jobs else float("nan")
 
     # -----------------------------------------------------------------
     # --- ALL NEW METHODS FOR MCTS---
@@ -445,53 +445,50 @@ class Network:
             return free # Returns {} if none are free
 
     def run_until_next_decision(self) -> Tuple[float, Dict[str, List[Server]]]:
-        """
-        The "stepper" function for MCTS.
-        Runs the sim until the next decision epoch is reached.
-        
-        Returns:
-            (t, free_servers): The time of the decision and the
-                               available servers.
-            (t, {}): If the simulation ends.
-        """
-        
-        # Seed if this is the very first step
-        if not self._seeded:
-            for ap in self.arrivals:
-                t_next = ap.schedule_next(self.t)
-                self.schedule(t_next, EventType.ARRIVAL, {"ap": ap})
-            self._seeded = True
-
-        while self._event_q:
-            # 1. Check if a decision is needed *right now*
-            # This happens if a clone was made at a decision epoch
-            # *before* the policy was called.
-            free_now = self._get_free_servers()
-            if free_now:
-                return (self.t, free_now)
-
-            # 2. Get next event
-            ev = heapq.heappop(self._event_q)
-    
-            # 3. Advance time (ignore metrics for this fast inner sim)
-            self.t = ev.time
-    
-            # 4. Handle event
-            if ev.type == EventType.ARRIVAL:
-                self._on_arrival(ev.payload["ap"])
-            elif ev.type == EventType.DEPARTURE:
-                self._on_departure(ev.payload["station_id"], ev.payload["server_idx"])
+            """
+            The "stepper" function for MCTS.
+            Runs the sim until the next decision epoch is reached.
+            """
             
-            # 5. Check if a decision is now needed
-            free_after_event = self._get_free_servers()
-            if free_after_event:
-                # A decision is needed. STOP and return.
-                return (self.t, free_after_event)
-            
-            # If no free servers, loop to the next event...
+            # Seed if this is the very first step
+            if not self._seeded:
+                for ap in self.arrivals:
+                    t_next = ap.schedule_next(self.t)
+                    self.schedule(t_next, EventType.ARRIVAL, {"ap": ap})
+                self._seeded = True
+    
+            while self._event_q:
+
+                ev = heapq.heappop(self._event_q)
         
-        # Simulation event queue is empty
-        return (self.t, {})
+                # --- FIX: CALCULATE DT AND UPDATE AREAS ---
+                dt = ev.time - self.t
+                if dt > 0:
+                    for st in self.stations.values():
+                        # Accumulate area for jobs in queues
+                        for qid, q in st.queues.items():
+                            st._ql_area[qid] += len(q) * dt
+                        
+                        # Accumulate area for jobs in service
+                        # (Optimized check: only count busy servers)
+                        num_busy_servers = sum(1 for srv in st.servers if srv.busy)
+                        st._sl_area += num_busy_servers * dt
+                # ------------------------------------------
+                # 3. Advance time
+                self.t = ev.time
+        
+                # 4. Handle event
+                if ev.type == EventType.ARRIVAL:
+                    self._on_arrival(ev.payload["ap"])
+                elif ev.type == EventType.DEPARTURE:
+                    self._on_departure(ev.payload["station_id"], ev.payload["server_idx"])
+                
+                # 5. Check if a decision is now needed
+                free_after_event = self._get_free_servers()
+                if free_after_event:
+                    return (self.t, free_after_event)
+                
+            return (self.t, {})
 
 
 # -------- Utility samplers (Exp arrivals/services) --------
