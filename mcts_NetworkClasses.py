@@ -356,6 +356,7 @@ class Network:
         assignments = self.policy.decide(self, self.t, free_servers=free)
 
         # start service for each assigned server
+
         for srv, q in assignments.items():
             if len(q) == 0 or srv.busy:
                 continue
@@ -460,8 +461,6 @@ class Network:
             while self._event_q:
 
                 ev = heapq.heappop(self._event_q)
-        
-                # --- FIX: CALCULATE DT AND UPDATE AREAS ---
                 dt = ev.time - self.t
                 if dt > 0:
                     for st in self.stations.values():
@@ -470,7 +469,6 @@ class Network:
                             st._ql_area[qid] += len(q) * dt
                         
                         # Accumulate area for jobs in service
-                        # (Optimized check: only count busy servers)
                         num_busy_servers = sum(1 for srv in st.servers if srv.busy)
                         st._sl_area += num_busy_servers * dt
                 # ------------------------------------------

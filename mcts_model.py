@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[22]:
+# In[4]:
 
 
 from __future__ import annotations
@@ -35,23 +35,23 @@ CONFIG = {
     "MAX_QUEUES_PER_STATION": 3,  
     
     "learning_rate": 0.001,
-    "buffer_size": 250000,
-    "batch_size": 256, 
+    "buffer_size": 100000,
+    "batch_size": 2048, #2048 
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 
-    "mcts_simulations": 200,   # This is low. But we have computational bottleneck.
+    "mcts_simulations": 350, 
     "c_puct": 1.5,
     "mcts_sim_horizon_s": 100.0,
-    "temperature": 1.0,
+    "temperature": 0.3,
     "dirichlet_alpha": 0.3,   
-    "dirichlet_epsilon": 0.15, 
+    "dirichlet_epsilon": 0.1,
     "discount_factor": 0.97,  # Experiment.
     
     "num_train_loops": 100,
-    "episodes_per_loop": 30,      
-    "train_steps_per_loop": 150,  # <--- INCREASED per recommendation
-    "sim_run_duration": 10000.0,    
-    "CATASTROPHE_SOJOURN_TIME": 80.0, 
+    "episodes_per_loop": 35,     #35 
+    "train_steps_per_loop": 100, #120
+    "sim_run_duration": 4000.0, #4000 
+    "CATASTROPHE_SOJOURN_TIME": 50.0, 
     "seed": 1
 }
 
@@ -61,22 +61,24 @@ class AlphaZeroNN(nn.Module):
         super(AlphaZeroNN, self).__init__()
         self.state_size = state_size
         self.action_space_size = action_space_size
+        
         self.body = nn.Sequential(
             nn.Linear(self.state_size, 256),
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU()
         )
+        
         self.policy_head = nn.Sequential(
             nn.Linear(256, 128),
             nn.ReLU(),
             nn.Linear(128, self.action_space_size)
         )
+        
         self.value_head = nn.Sequential(
             nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(128, 1),
-            nn.Tanh()
+            nn.Linear(128, 1), 
         )
 
     def forward(self, state):
@@ -90,15 +92,16 @@ class ReplayBuffer:
     def __init__(self, buffer_size):
         self.buffer = deque(maxlen=buffer_size)
 
-    def push(self, state, policy_target, value_target):
-        self.buffer.append((state, policy_target, value_target))
+    def push(self, state, policy_target, value_target, action_mask):
+        self.buffer.append((state, policy_target, value_target, action_mask))
 
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
-        states, policy_targets, value_targets = zip(*batch)
+        states, policy_targets, value_targets, action_mask = zip(*batch)
         return (np.array(states), 
                 np.array(policy_targets), 
-                np.array(value_targets).reshape(-1, 1))
+                np.array(value_targets).reshape(-1, 1),
+               np.array(action_mask))
 
     def __len__(self):
         return len(self.buffer)
@@ -145,35 +148,36 @@ class MCTSNode:
             # This creates [log(q1), log(q2)..., 0.0, 0.0]
             log_queues = np.log1p(np.array(padded_state, dtype=np.float32))
 
-            # 4. Create Server Context (One-Hot)
+            # 4. Create Station Context (One-Hot)
             server_one_hot = np.zeros(L, dtype=np.float32)
             if context_server_idx >= 0 and context_server_idx < L:
                 server_one_hot[context_server_idx] = 1.0
-                
             # 5. Concatenate: [Queues..., Padding..., Servers...]
             self._state_vector = np.concatenate([log_queues, server_one_hot])
             
         return self._state_vector
-            
-        return self._state_vector
+
     def expand(self, policy_probs: np.ndarray):
         for action_idx, prob in enumerate(policy_probs):
             if prob > 0: 
                 if action_idx not in self.children:
                     self.children[action_idx] = MCTSNode(parent=self, prior_p=prob)
 
+    #Problem here was that the exploitation term completely destroys NN's suggestion. Fix implemented below.
     def select_child_puct(self, c_puct: float) -> Tuple[int, MCTSNode]:
         best_score = -np.inf
         best_action_idx = -1
         best_child = None
         sqrt_self_N = math.sqrt(self.N)
         
-        for action_idx, child in self.children.items():
+        for action_idx, child in self.children.items():         
             score = child.Q + c_puct * child.P * (sqrt_self_N / (1 + child.N))
+            
             if score > best_score:
                 best_score = score
                 best_action_idx = action_idx
                 best_child = child
+                
         return best_action_idx, best_child
 
     def update_stats(self, value: float):
@@ -249,43 +253,46 @@ class MCTS_Policy(SchedulingPolicy):
         #Find server to assign.
         server_to_assign = None
         station_id_for_server = None 
+        action_maskx = self._get_action_mask(net, free_servers)
         for st_id, srvs in free_servers.items():
             if srvs:
                 server_to_assign = srvs[0]
                 station_id_for_server = st_id     
                 break
-
+        
         #Check if there are any jobs.
         target_station = net.stations[station_id_for_server]
         target_station_id = station_id_for_server
-        jobs_at_station = sum(len(q) for q in target_station.queues.values())
-        
-        if jobs_at_station == 0:
-            # No jobs for this specific server -> Must Wait (NULL).
-            
-            # Create a dummy root for return types
+        jobs_at_station = sum(len(q) for q in target_station.queues.values())  
+        root_srv_idx = self._get_server_context_idx(target_station_id)
+
+        if jobs_at_station == 0 or server_to_assign is None:
             root = MCTSNode()
             # Get the correct context index for the neural net input (e.g., S1 -> 0, S2 -> 1)
-            root_srv_idx = self._get_server_context_idx(target_station_id)
             state_vec = root.get_state_vector(net, self.config["MAX_QUEUES_STATE"], root_srv_idx)
-            
-            # Return empty assignments immediately
-            return {}, root, state_vec, 0.0
-
-        #Check if there's actually a free server.
-        if server_to_assign is None:
+            return {}, root, state_vec, 0.0, action_maskx
+        
+        #If only there's one free queue, take it.
+        occupied = 0
+        o_queues = []
+        for q in target_station.queues.values():
+            if len(q) >= 1: 
+                occupied += 1
+                o_queues.append(q)
+        if occupied == 1:
             root = MCTSNode()
             state_vec = root.get_state_vector(net, self.config["MAX_QUEUES_STATE"], root_srv_idx)
-            return {}, root, state_vec, 0.0
-
+            return {server_to_assign: o_queues[0]}, root, state_vec, 0.0, action_maskx
+            
         #Make sure the network is cloneable. 
         try:
             real_snapshot = net.clone()
         except:
             root = MCTSNode()
             state_vec = root.get_state_vector(net, self.config["MAX_QUEUES_STATE"], root_srv_idx)
-            return {}, root, state_vec, 0.0
+            return {}, root, state_vec, 0.0, action_maskx
 
+        # ---- BEGIN ACTUAL MCTS -----
         #Get one-hot encoding for free station.
         root_srv_idx = -1
         if station_id_for_server:
@@ -294,13 +301,15 @@ class MCTS_Policy(SchedulingPolicy):
         root = MCTSNode()
         state_vec = root.get_state_vector(net, self.config["MAX_QUEUES_STATE"], root_srv_idx)
         search_free_servers = {station_id_for_server: [server_to_assign]}
-        
-        #rng_state = random.getstate()
-        #np_rng_state = np.random.get_state()
-        
+        sim_count = 0
         for _ in range(self.config["mcts_simulations"]):
-            #random.setstate(rng_state)
-            #np.random.set_state(np_rng_state)
+
+            #--- DEBUG PRINT --- Root Children Stats
+            # vc = []
+            # for child in root.children.items():
+            #     vc.append(child[1].N)
+            # print(vc)
+            
             node = root
             sim_net = real_snapshot.clone()
             sim_t = t
@@ -308,20 +317,20 @@ class MCTS_Policy(SchedulingPolicy):
             
             path = [node]
             step_rewards = []
-            
+            actions = []
             while node.children: 
-                #print(node.children)
+                
                 action_idx, node = node.select_child_puct(self.config["c_puct"])
                 path.append(node)
+                actions.append(self.idx_to_action[action_idx])
                 #print("1. idx_to_action",self.idx_to_action[action_idx], action_idx)
                 (sim_net, sim_t, sim_free_servers, is_terminal, step_reward) = self._run_sim_step(sim_net, self.idx_to_action[action_idx])
                 step_rewards.append(step_reward)
                 if is_terminal:
                     node._is_terminal = True
                     break
-            
             value = 0.0 
-            #print("terminal", node._is_terminal)
+
             if not node._is_terminal:
                 
                 leaf_srv_idx = -1
@@ -355,23 +364,33 @@ class MCTS_Policy(SchedulingPolicy):
                                 idx += 1
                                 
                 node.expand(policy_probs)
-            
-            # Backprop with One-Step Reward
+                
+            # # Backprop with Standard Accumulation
             gamma = self.config["discount_factor"]
             curr_val = value 
-            node.update_stats(curr_val)
+            path[-1].update_stats(value)
             for i in range(len(path) - 2, -1, -1):
-                node = path[i]
-                reward = step_rewards[i]
-                curr_val = (1 - gamma) * reward + gamma * curr_val
-                node.update_stats(curr_val)
+                parent = path[i]
+                curr_val = step_rewards[i] + gamma * curr_val
+                parent.update_stats(curr_val)
 
+        # --- DEBUG TRACE--- Checking Prior vs MCTS dist
+        # print(f"\n--- MCTS Final Stats (Sims: {self.config['mcts_simulations']}) ---")
+        
+        # # Sort children by visit count to see the winner clearly
+        # sorted_children = sorted(root.children.items(), key=lambda x: x[1].N, reverse=True)
+        
+        # for action_idx, child in sorted_children:
+        #     action_name = self.idx_to_action[action_idx]
+        #     # Print N (Visits), Q (Value), and P (Prior probability from NN)
+        #     print(f"Action {action_name}: N={child.N:4d} | Q={child.Q:.4f} | Prior={child.P:.4f}")
+            
         if not root.children:
             best_action_idx = self.NULL_ACTION_IDX
         else:
             best_action_idx = max(root.children, key=lambda idx: root.children[idx].N)
-        
         best_action = self.idx_to_action[best_action_idx]
+        
         assignments = {}
         srv_id, qid = best_action
         if srv_id != "NULL":
@@ -379,10 +398,7 @@ class MCTS_Policy(SchedulingPolicy):
             if srv.server_id == srv_id:
                 assignments[srv] = net.stations[station_id_for_server].queues[qid]
 
-        # --- Return root.Q as the value target over episode reward ---
-        # We return root.Q (which contains the One-Step Reward integration)
-        # instead of relying on the noisy episode outcome later.
-        return assignments, root, state_vec, root.Q
+        return assignments, root, state_vec, root.Q, action_maskx
 
     def _run_sim_step(self, sim_net: Network, action: Tuple[str, str]) -> Tuple[Network, float, Dict, bool, float]:
         t_start = sim_net.t
@@ -414,7 +430,6 @@ class MCTS_Policy(SchedulingPolicy):
             
         avg_size = total_sys_size_integral / dt
         step_reward = self._compute_score(avg_size)
-        #print(total_sys_size_integral, avg_size, dt)
         is_terminal = (not sim_net._event_q) or (new_t > t_start + self.config["mcts_sim_horizon_s"])
         return sim_net, new_t, new_free, is_terminal, step_reward
 
@@ -439,7 +454,123 @@ class MCTS_Policy(SchedulingPolicy):
             else:
                 for idx in action_indices: policy_target[idx] = 1.0/len(action_indices)
         return policy_target
+        
+class NN_Policy:    
+    def __init__(self, model: AlphaZeroNN):
+        config = CONFIG
+        self.model = model
+        self.config = CONFIG
+        self.device = config["device"]
+        self.master_action_list = self._build_master_action_list()
+        self.action_to_idx = {action: i for i, action in enumerate(self.master_action_list)}
+        self.idx_to_action = {i: action for i, action in enumerate(self.master_action_list)}
+        self.NULL_ACTION_IDX = self.action_to_idx[("NULL", "NULL")]
 
+    def _build_master_action_list(self) -> List[Tuple[str, str]]:
+        actions = []
+        for i in range(1, self.config["L"] + 1):
+            station_id = f"S{i}"
+            server_id = f"{station_id}-s0"
+            for k in range(1, 4):
+                class_id = 3 * (i - 1) + k
+                queue_id = f"Q{class_id}"
+                actions.append((server_id, queue_id))
+        actions.append(("NULL", "NULL"))
+        return actions
+
+    def _get_server_context_idx(self, station_id: str) -> int:
+        # Assumes station_id is "S1", "S2", etc.
+        # Returns 0 for S1, 1 for S2...
+        return int(station_id.replace("S", "")) - 1
+
+    
+    def _get_action_mask(self, sim_net: Network, free_servers: Dict[str, List[Server]]) -> np.ndarray:
+        mask = np.zeros(len(self.master_action_list), dtype=int)
+        
+        # 1. Identify which queues have jobs
+        non_empty_queues = {
+            (sid, qid) for sid, st in sim_net.stations.items()
+            for qid, q in st.queues.items() if len(q) > 0
+        }
+        
+        found_legal_action = False
+        
+        # 2. Find all valid server-to-queue assignments
+        for station_id, srvs in free_servers.items():
+            for srv in srvs:
+                for action_idx, (srv_id, qid) in enumerate(self.master_action_list):
+                    # STRICT MATCH: Ensure Action Server ID == Real Server ID
+                    if srv.server_id == srv_id:
+                        if (station_id, qid) in non_empty_queues:
+                            mask[action_idx] = 1
+                            found_legal_action = True
+                            
+        # 3. ONLY allow NULL if we found NO other legal actions
+        # This forces the policy to be "Work Conserving"
+        if not found_legal_action:
+            mask[self.NULL_ACTION_IDX] = 1
+            
+        return mask
+    
+    def _compute_score(self, mean_sys_size: float) -> float:
+        cat_val = self.config["CATASTROPHE_SOJOURN_TIME"]
+        log_val = np.log1p(mean_sys_size)
+        ref_log = np.log1p(cat_val)
+        final_score = 1.0 - (2.0 * (log_val / ref_log))
+        return final_score
+        
+    def decide(self, net: Network, t: float, free_servers: Dict[str, List[Server]]) -> Dict[Server, Queue]:
+        assignments = {}
+        
+        # 1. Iterate over ALL stations with free servers
+        for st_id, srvs in free_servers.items():
+            for server in srvs:
+                # 2. Local Context for this specific server
+                # We define a "Single Server" context to force the NN to focus
+                context_free = {st_id: [server]}
+                
+                # Get mask for ONLY this server
+                # (This prevents the "Ghost Assignment" bug)
+                action_mask = self._get_action_mask(net, context_free)
+                
+                # 3. Setup Dummy Root & State
+                dummy_root = MCTSNode()
+                # Determine context index (S1->0, S2->1)
+                srv_ctx_idx = self._get_server_context_idx(st_id)
+                
+                # Check jobs - If station empty, skip this server
+                station = net.stations[st_id]
+                if sum(len(q) for q in station.queues.values()) == 0:
+                    continue
+                    
+                state_vec = dummy_root.get_state_vector(net, self.config["MAX_QUEUES_STATE"], srv_ctx_idx)
+                
+                # 4. Neural Network Inference
+                state_tensor = torch.tensor(state_vec, dtype=torch.float32).unsqueeze(0).to(self.device)
+                
+                with torch.no_grad():
+                    policy_logits, _ = self.model(state_tensor)
+                
+                policy_logits = policy_logits.squeeze(0)
+                
+                # 5. Apply Mask
+                mask_tensor = torch.tensor(action_mask, dtype=torch.bool).to(self.device)
+                policy_logits[~mask_tensor] = -1e9
+                
+                # 6. Select Action
+                best_action_idx = torch.argmax(policy_logits).item()
+                best_action = self.idx_to_action[best_action_idx]
+                
+                # 7. Decode Action
+                target_srv_id, target_q_id = best_action
+                
+                if target_srv_id != "NULL":
+                    # Double check we are assigning to the correct server ID
+                    if server.server_id == target_srv_id:
+                        assignments[server] = station.queues[target_q_id]
+
+        return assignments
+        
 class FixedActionPolicy(SchedulingPolicy):
     def __init__(self, action): self.srv_id, self.qid = action
     def decide(self, net, t, free_servers):
@@ -489,8 +620,7 @@ class Trainer:
 
     def train_step(self) -> Optional[float]:
         if len(self.replay_buffer) < self.config["batch_size"]: return None 
-        states, policy_targets, value_targets = self.replay_buffer.sample(self.config["batch_size"])
-        
+        states, policy_targets, value_targets, action_mask = self.replay_buffer.sample(self.config["batch_size"])
         states = torch.tensor(states, dtype=torch.float32).to(self.device)
         policy_targets = torch.tensor(policy_targets, dtype=torch.float32).to(self.device)
         value_targets = torch.tensor(value_targets, dtype=torch.float32).to(self.device)
@@ -499,9 +629,11 @@ class Trainer:
         policy_logits, values = self.model(states)
         
         value_loss = F.mse_loss(values, value_targets)
-        policy_loss = F.cross_entropy(policy_logits, policy_targets)
+        action_mask = torch.tensor(action_mask, dtype=torch.bool).to(self.device)
+        policy_logits = policy_logits.masked_fill(action_mask == False, -torch.inf)
+        policy_log_probs = F.softmax(policy_logits, dim=1)
+        policy_loss = F.kl_div(policy_log_probs, policy_targets, reduction='batchmean')
         total_loss = value_loss + policy_loss 
-        
         self.optimizer.zero_grad()
         total_loss.backward()
         self.optimizer.step()
@@ -540,8 +672,8 @@ class Trainer:
             for history, score, raw_metric, duration in episode_results:
                 avg_score += score
                 avg_raw += raw_metric
-                for state_vec, policy_target, root_q in history:
-                    self.replay_buffer.push(state_vec, policy_target, root_q) #conflicted root_q or score.
+                for state_vec, policy_target, root_q, action_mask in history:
+                    self.replay_buffer.push(state_vec, policy_target, root_q, action_mask) #conflicted root_q or score.
                     total_samples += 1
                     
             total_duration = sum(d for _, _, _, d in episode_results)
@@ -551,6 +683,7 @@ class Trainer:
             print(f"  Avg Score: {avg_score/len(episode_results):.4f}")
             print(f"  Avg Sys Size: {avg_raw/len(episode_results):.4f}")
             print(f"  Avg Episode Time: {avg_duration:.2f}s") 
+            print(f"  Buffer Size: {len(self.replay_buffer)}")
             avg_loss = 0
             t_steps = 0
             for _ in range(self.config["train_steps_per_loop"]):
@@ -559,16 +692,6 @@ class Trainer:
                     avg_loss += loss
                     t_steps += 1
             if t_steps > 0: print(f"  Avg Loss: {avg_loss/t_steps:.4f}")
-            
-            if (i+1) % 10 == 0: self.save_model(f"model_loop_{i+1}.pth")
-
-    # (Sequential debug method omitted for brevity, ensure get_final_outcome has self)
-    def get_final_outcome(self, net: Network) -> Tuple[float, float]:
-        mean_sys_size = self.calculate_mean_system_size(net) 
-        log_val = np.log1p(mean_sys_size)
-        ref_log = np.log1p(self.config["CATASTROPHE_SOJOURN_TIME"])
-        final_score = 1.0 - (2.0 * (log_val / ref_log))
-        return float(final_score), mean_sys_size
 
 
 # In[14]:

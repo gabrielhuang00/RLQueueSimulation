@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[5]:
+# In[1]:
 
 
 import torch
@@ -73,11 +73,11 @@ def run_episode_worker(args):
 
         free_servers = net._get_free_servers()
         while free_servers:
-            assignments, root, state_vec, root_q = local_policy.decide(net, net.t, free_servers)
+            assignments, root, state_vec, root_q, action_mask = local_policy.decide(net, net.t, free_servers)
             
-            if decisions_in_episode % 5 == 0: 
-                policy_target = local_policy.get_policy_target(root, local_config["temperature"])
-                episode_history.append((state_vec, policy_target, root_q))
+            #if decisions_in_episode % 5 == 0: 
+            policy_target = local_policy.get_policy_target(root, local_config["temperature"])
+            episode_history.append((state_vec, policy_target, root_q, action_mask))
             
             root.detach()
 
@@ -96,12 +96,9 @@ def run_episode_worker(args):
     elapsed = max(net.t - start_time, 1e-12)
     total_area = sum(sum(st._ql_area.values()) + st._sl_area for st in net.stations.values())
     mean_sys_size = total_area / elapsed
-    
-    cat_val = local_config["CATASTROPHE_SOJOURN_TIME"]
-    log_val = np.log1p(mean_sys_size)
-    ref_log = np.log1p(cat_val)
-    final_score = 1.0 - (2.0 * (log_val / ref_log))
+    final_score = temp_policy._compute_score(mean_sys_size)
     wall_duration = time.process_time() - wall_start
+
     
     return episode_history, float(final_score), mean_sys_size, wall_duration
 
